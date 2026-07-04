@@ -22,7 +22,7 @@ def add_cors(resp):
 
 def _tk_post(method, body):
     r = requests.post(
-        f'{TINKOFF_BASE}/{method}',
+        f'{TINKOFF_BASE}.{method}',
         json=body,
         headers={'Authorization': f'Bearer {TINKOFF_TOKEN}',
                  'Content-Type': 'application/json'},
