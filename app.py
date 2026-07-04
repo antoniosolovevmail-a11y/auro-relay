@@ -4,6 +4,7 @@
 # ═══════════════════════════════════════════════════════════════
 import os
 import time
+import traceback
 import requests
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
@@ -43,12 +44,33 @@ _uid_cache = {}
 def resolve_uid(ticker):
     if ticker in _uid_cache:
         return _uid_cache[ticker]
-    d = _tk_post('InstrumentsService/ShareBy', {
-        'idType': 'INSTRUMENT_ID_TYPE_TICKER',
-        'classCode': 'TQBR',
-        'id': ticker
-    })
-    uid = d.get('instrument', {}).get('uid')
+    uid = None
+    # Способ 1: ShareBy
+    try:
+        d = _tk_post('InstrumentsService/ShareBy', {
+            'idType': 'INSTRUMENT_ID_TYPE_TICKER',
+            'classCode': 'TQBR',
+            'id': ticker
+        })
+        uid = d.get('instrument', {}).get('uid')
+    except Exception:
+        pass
+    # Способ 2 (fallback): FindInstrument
+    if not uid:
+        try:
+            d = _tk_post('InstrumentsService/FindInstrument', {
+                'query': ticker,
+                'instrumentKind': 'INSTRUMENT_TYPE_SHARE'
+            })
+            for inst in d.get('instruments', []):
+                if inst.get('ticker') == ticker and inst.get('classCode') == 'TQBR':
+                    uid = inst.get('uid')
+                    break
+            # если точного не нашли — берём первый
+            if not uid and d.get('instruments'):
+                uid = d['instruments'][0].get('uid')
+        except Exception:
+            pass
     if uid:
         _uid_cache[ticker] = uid
     return uid
@@ -77,7 +99,10 @@ def tinkoff_candles():
     days = int(request.args.get('days', TF_DEPTH.get(tf, 30)))
 
     interval, chunk_days = TF_MAP.get(tf, TF_MAP['1D'])
-    uid = resolve_uid(ticker)
+    try:
+        uid = resolve_uid(ticker)
+    except Exception as e:
+        return jsonify({'error': f'resolve failed: {e}'}), 500
     if not uid:
         return jsonify({'error': f'ticker {ticker} not found'}), 404
 
@@ -124,32 +149,48 @@ def tinkoff_candles():
 def tinkoff_price():
     if not TINKOFF_TOKEN:
         return jsonify({'error': 'TINKOFF_TOKEN not set'}), 500
-    tickers = request.args.get('tickers', 'SBER').split(',')[:50]
-    uids, tick_by_uid = [], {}
-    for t in tickers:
-        uid = resolve_uid(t.strip())
-        if uid:
-            uids.append(uid)
-            tick_by_uid[uid] = t.strip()
-    if not uids:
-        return jsonify({'error': 'no valid tickers'}), 404
+    try:
+        tickers = request.args.get('tickers', 'SBER').split(',')[:50]
+        uids, tick_by_uid = [], {}
+        errors = []
+        for t in tickers:
+            try:
+                uid = resolve_uid(t.strip())
+                if uid:
+                    uids.append(uid)
+                    tick_by_uid[uid] = t.strip()
+                else:
+                    errors.append(f'{t}: not found')
+            except Exception as e:
+                errors.append(f'{t}: {e}')
+        if not uids:
+            return jsonify({'error': 'no valid tickers', 'details': errors}), 404
 
-    last = _tk_post('MarketDataService/GetLastPrices', {'instrumentId': uids})
-    close = _tk_post('MarketDataService/GetClosePrices', {
-        'instruments': [{'instrumentId': u} for u in uids]})
+        last = _tk_post('MarketDataService/GetLastPrices', {'instrumentId': uids})
 
-    close_by_uid = {c.get('instrumentUid'): _q(c.get('price'))
-                    for c in close.get('closePrices', [])}
-    result = {}
-    for p in last.get('lastPrices', []):
-        uid = p.get('instrumentUid')
-        ticker = tick_by_uid.get(uid)
-        price = _q(p.get('price'))
-        prev = close_by_uid.get(uid)
-        pct = ((price - prev) / prev * 100) if (price and prev) else None
-        if ticker:
-            result[ticker] = {'p': price, 'c': pct, 'prev': prev}
-    return jsonify({'prices': result, 'source': 'tinkoff'})
+        # ClosePrices — опционально: если упадёт, проценты будут null
+        close_by_uid = {}
+        try:
+            close = _tk_post('MarketDataService/GetClosePrices', {
+                'instruments': [{'instrumentId': u} for u in uids]})
+            close_by_uid = {c.get('instrumentUid'): _q(c.get('price'))
+                            for c in close.get('closePrices', [])}
+        except Exception:
+            pass
+
+        result = {}
+        for p in last.get('lastPrices', []):
+            uid = p.get('instrumentUid')
+            ticker = tick_by_uid.get(uid)
+            price = _q(p.get('price'))
+            prev = close_by_uid.get(uid)
+            pct = ((price - prev) / prev * 100) if (price and prev) else None
+            if ticker:
+                result[ticker] = {'p': price, 'c': pct, 'prev': prev}
+        return jsonify({'prices': result, 'source': 'tinkoff'})
+    except Exception as e:
+        return jsonify({'error': str(e),
+                        'trace': traceback.format_exc().splitlines()[-5:]}), 500
 
 @app.route('/brent')
 def brent():
