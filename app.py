@@ -38,6 +38,18 @@ def _q(quotation):
         return None
     return float(quotation.get('units', 0)) + quotation.get('nano', 0) / 1e9
 
+# ── Кэш ответов (candles тяжёлые — держим 20 сек) ──
+_resp_cache = {}
+def _cache_get(key, ttl=20):
+    e = _resp_cache.get(key)
+    if e and time.time() - e[0] < ttl:
+        return e[1]
+    return None
+def _cache_set(key, data):
+    _resp_cache[key] = (time.time(), data)
+    if len(_resp_cache) > 200:
+        _resp_cache.clear()
+
 # ── Кэш тикер → instrument_uid (резолвим один раз) ──
 _uid_cache = {}
 
@@ -88,7 +100,7 @@ TF_MAP = {
 }
 # Сколько истории грузить по умолчанию (дней)
 TF_DEPTH = {'1M': 2, '5M': 5, '15M': 10, '1H': 30, '4H': 90,
-            '1D': 730, '1W': 1825, '1Mo': 3650}
+            '1D': 365, '1W': 1825, '1Mo': 3650}
 
 @app.route('/tinkoff/candles')
 def tinkoff_candles():
@@ -97,6 +109,10 @@ def tinkoff_candles():
     ticker = request.args.get('ticker', 'SBER')
     tf = request.args.get('tf', '1D')
     days = int(request.args.get('days', TF_DEPTH.get(tf, 30)))
+
+    cached = _cache_get(f'candles:{ticker}:{tf}:{days}', ttl=15)
+    if cached:
+        return jsonify(cached)
 
     interval, chunk_days = TF_MAP.get(tf, TF_MAP['1D'])
     try:
@@ -143,7 +159,9 @@ def tinkoff_candles():
         if c['time'] not in seen:
             seen.add(c['time'])
             out.append(c)
-    return jsonify({'candles': out, 'source': 'tinkoff'})
+    payload = {'candles': out, 'source': 'tinkoff'}
+    _cache_set(f'candles:{ticker}:{tf}:{days}', payload)
+    return jsonify(payload)
 
 @app.route('/tinkoff/price')
 def tinkoff_price():
